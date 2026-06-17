@@ -1,12 +1,10 @@
 swraid_lvm_btrfs:
     disks: ''
     spare_disks: ''
-    raid: 
-    required_disks: 
-    raidname: 
+    raid:
+    required_disks:
+    raidname:
     metadata: '1.2'
-    vg_name: 
-    lv_name: 
+    vg_name:
+    lv_name:
     fs: 'btrfs'
-
-# Made with Bob

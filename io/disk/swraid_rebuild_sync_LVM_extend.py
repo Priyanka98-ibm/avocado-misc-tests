@@ -11,7 +11,7 @@
 # See LICENSE for more details.
 #
 # Copyright: 2026 IBM
-# Author: Priyanka Behera <priyankabehera@example.com>
+# Author: Priyanka Behera <priyanka.behera2@ibm.com>
 
 """
 Software RAID Rebuild + Sync + LVM Extend Test
@@ -49,6 +49,22 @@ class SwraidLvmExtend(Test):
                 if not smm.install(pkg):
                     self.cancel("Unable to install %s" % pkg)
 
+        # Check and install filesystem utilities based on the selected filesystem
+        self.fs_name = self.params.get('fs', default='ext4').lower()
+        fs_packages = {
+            'ext4': 'e2fsprogs',
+            'ext3': 'e2fsprogs',
+            'xfs': 'xfsprogs',
+            'btrfs': 'btrfs-progs' if detected_distro.name not in ['Ubuntu', 'debian'] else 'btrfs-tools'
+        }
+
+        if self.fs_name in fs_packages:
+            fs_pkg = fs_packages[self.fs_name]
+            if not smm.check_installed(fs_pkg):
+                self.log.info("Installing filesystem utility %s...", fs_pkg)
+                if not smm.install(fs_pkg):
+                    self.cancel("Unable to install %s for %s filesystem" % (fs_pkg, self.fs_name))
+
         disks = (self.params.get('disks', default='').strip()).split()
         if not disks:
             self.cancel('No disks provided for RAID creation')
@@ -73,7 +89,6 @@ class SwraidLvmExtend(Test):
 
         self.vg_name = self.params.get('vg_name', default='test_vg')
         self.lv_name = self.params.get('lv_name', default='test_lv')
-        self.fs_name = self.params.get('fs', default='ext4').lower()
         self.mount_loc = os.path.join(self.workdir, 'mountpoint')
 
         if not os.path.isdir(self.mount_loc):
@@ -219,6 +234,11 @@ class SwraidLvmExtend(Test):
         result = process.run("lvdisplay %s" % lv_path, shell=True)
         self.log.info("Current LV Info:\n%s", result.stdout_text)
 
+        # Get filesystem size before extend
+        df_before = process.run("df -B1 %s | tail -1" % self.mount_loc, shell=True)
+        size_before = int(df_before.stdout_text.split()[1])
+        self.log.info("Filesystem size before extend: %d bytes", size_before)
+
         self.log.info("Extending %s by 20%% of VG...", self.lv_name)
         try:
             process.run("lvextend -l +20%%VG %s" % lv_path, shell=True)
@@ -242,6 +262,19 @@ class SwraidLvmExtend(Test):
 
         result = process.run("df -h", shell=True)
         self.log.info("Filesystem after extend:\n%s", result.stdout_text)
+
+        # Validate filesystem size has increased
+        df_after = process.run("df -B1 %s | tail -1" % self.mount_loc, shell=True)
+        size_after = int(df_after.stdout_text.split()[1])
+        self.log.info("Filesystem size after extend: %d bytes", size_after)
+
+        if size_after <= size_before:
+            self.fail("Filesystem size did not increase after extend operation. "
+                      "Before: %d bytes, After: %d bytes" % (size_before, size_after))
+
+        size_increase = size_after - size_before
+        self.log.info("Filesystem successfully extended by %d bytes (%.2f MB)",
+                      size_increase, size_increase / (1024 * 1024))
 
         self.log.info("LVM extend completed successfully")
 
@@ -287,5 +320,3 @@ class SwraidLvmExtend(Test):
                 self.log.warning("Error cleaning RAID: %s", err)
 
         self.log.info("Cleanup completed")
-
-# Made with Bob
