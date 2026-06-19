@@ -1,0 +1,78 @@
+# Software RAID Rebuild + Sync + LVM Extend Test Configuration
+#
+# This YAML file provides configuration parameters for the swraid_lvm_extend test.
+# It defines the disks, RAID level, and LVM settings for testing.
+
+# Test: Basic RAID1 with LVM extend
+swraid_lvm_basic:
+    disks: 'sdb sdc'
+    spare_disks: ''
+    raid: '1'
+    required_disks: 2
+    raidname: '/dev/md/test_raid'
+    metadata: '1.2'
+    vg_name: 'test_vg'
+    lv_name: 'test_lv'
+    fs: 'ext4'
+
+# Test: RAID5 with 3 disks and 1 spare
+swraid_lvm_raid5:
+    disks: 'sdb sdc sdd'
+    spare_disks: 'sde'
+    raid: '5'
+    required_disks: 3
+    raidname: '/dev/md/raid5_test'
+    metadata: '1.2'
+    vg_name: 'raid5_vg'
+    lv_name: 'raid5_lv'
+    fs: 'ext4'
+
+# Test: RAID6 with 4 disks
+swraid_lvm_raid6:
+    disks: 'sdb sdc sdd sde'
+    spare_disks: 'sdf'
+    raid: '6'
+    required_disks: 4
+    raidname: '/dev/md/raid6_test'
+    metadata: '1.2'
+    vg_name: 'raid6_vg'
+    lv_name: 'raid6_lv'
+    fs: 'ext4'
+
+# Test: RAID10 with 4 disks
+swraid_lvm_raid10:
+    disks: 'sdb sdc sdd sde'
+    spare_disks: ''
+    raid: '10'
+    required_disks: 4
+    raidname: '/dev/md/raid10_test'
+    metadata: '1.2'
+    vg_name: 'raid10_vg'
+    lv_name: 'raid10_lv'
+    fs: 'ext4'
+
+# Test: RAID1 with XFS filesystem
+swraid_lvm_xfs:
+    disks: 'sdb sdc'
+    spare_disks: ''
+    raid: '1'
+    required_disks: 2
+    raidname: '/dev/md/xfs_raid'
+    metadata: '1.2'
+    vg_name: 'xfs_vg'
+    lv_name: 'xfs_lv'
+    fs: 'xfs'
+
+# Test: RAID1 with BTRFS filesystem
+swraid_lvm_btrfs:
+    disks: 'sdb sdc'
+    spare_disks: ''
+    raid: '1'
+    required_disks: 2
+    raidname: '/dev/md/btrfs_raid'
+    metadata: '1.2'
+    vg_name: 'btrfs_vg'
+    lv_name: 'btrfs_lv'
+    fs: 'btrfs'
+
+# Made with Bob
