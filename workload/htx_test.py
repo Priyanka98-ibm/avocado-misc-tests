@@ -14,6 +14,7 @@
 # Author: Praveen K Pandey <praveen@linux.vnet.ibm.com>
 #         Naresh Bannoth <nbannoth@in.ibm.com>
 #         Maram Srimannarayana Murthy <msmurthy@linux.vnet.ibm.com>
+#         Priyanka Behera <priyanka@linux.vnet.ibm.com>
 #
 
 """
@@ -21,8 +22,9 @@ HTX Test
 
 Stress-tests IBM Power hardware using the HTX (Hardware Test eXecutive)
 framework.  Supports generic MDT-based runs (CPU, memory, pmem, isst) as
-well as targeted IO device stress via the respective YAML
-parameters.
+well as targeted IO device stress via the respective YAML parameters.
+Also supports block device stress on software RAID and LVM stacks via the
+test_htx_software_raid / test_htx_lvm / test_htx_sraid_lvm test methods.
 
 """
 
@@ -34,14 +36,17 @@ import time
 from avocado import Test
 from avocado.utils import disk
 from avocado.utils import distro
+from avocado.utils import lv_utils
 from avocado.utils import multipath
 from avocado.utils import process
+from avocado.utils import softwareraid
 from avocado.utils.software_manager.manager import SoftwareManager
 
 HTX_INSTALL_PATH = '/usr/lpp/htx'
 
 
 class HtxTest(Test):
+
     """
     HTX [Hardware Test eXecutive] is a test tool suite.  The goal of HTX is
     to stress test the system by exercising all hardware components
@@ -59,7 +64,7 @@ class HtxTest(Test):
         if 'ppc64' not in self.detected_distro.arch:
             self.cancel("Supported only on Power Architecture")
 
-        self.mdt_file = self.params.get('mdt_file', default='mdt.mem')
+        self.mdt_file = self.params.get('mdt_file', default='mdt.hd')
         self.htx_disks = self.params.get('htx_disks', default=None)
 
         _time_limit = self.params.get('time_limit', default=None)
@@ -68,10 +73,13 @@ class HtxTest(Test):
             _multiplier = 3600 if str(_unit).strip().lower() == 'h' else 60
             self.time_limit = int(_time_limit) * _multiplier
         else:
-            self.time_limit = int(self.params.get('time_interval', default=2)) * 60
+            self.time_limit = int(
+                self.params.get('time_interval', default=2)) * 60
         self.run_all = self.params.get('all', default=False)
         self.rpm_link = self.params.get('htx_rpm_link', default=None)
         self.dist_name = None
+        self.sraid = None
+        self.lv_backing_device = None
 
         self.block_device = ''
         if self.htx_disks and not self.run_all:
@@ -132,7 +140,6 @@ class HtxTest(Test):
             self.cancel(f"RPM download failed: {latest_htx_rpm}")
 
         tmp_rpm = f'/tmp/{latest_htx_rpm}'
-
         if process.system(
                 f'rpm -ivh --nodeps --force {tmp_rpm}',
                 shell=True, ignore_status=True):
@@ -184,7 +191,6 @@ class HtxTest(Test):
             if os.path.exists(HTX_INSTALL_PATH):
                 shutil.rmtree(HTX_INSTALL_PATH)
 
-        self.rpm_link = self.params.get('htx_rpm_link', default=None)
         if self.rpm_link:
             self.install_latest_htx_rpm()
         else:
@@ -388,3 +394,254 @@ class HtxTest(Test):
         process.system('umount /htx_pmem*', shell=True, ignore_status=True)
 
         self._stop_daemon()
+
+    # ------------------------------------------------------------------
+    # Block device helpers — RAID level mapping
+    # ------------------------------------------------------------------
+
+    def _get_raid_levels_for_disk_count(self, disk_list):
+        """
+        Return the list of RAID levels to create based on the number of
+        disks supplied.
+
+          1 disk  -> ['0']
+          2 disks -> ['1']
+          3 disks -> ['0', '1']
+          4 disks -> ['0', '1']
+          5 disks -> ['1', '5']
+          6 disks -> ['0', '1', '5']
+
+        Cancels the test for any disk count not in the mapping above.
+        RAID level is never read from YAML — it is derived solely from
+        the number of disks in self.htx_disks.
+        """
+        count = len(disk_list)
+        mapping = {
+            1: ["0"],
+            2: ["1"],
+            3: ["0", "1"],
+            4: ["0", "1"],
+            5: ["1", "5"],
+            6: ["0", "1", "5"],
+        }
+        if count not in mapping:
+            self.cancel(
+                "No RAID level mapping defined for %d disk(s). "
+                "Supported disk counts: 1, 2, 3, 4, 5, 6." % count)
+        return mapping[count]
+
+    # ------------------------------------------------------------------
+    # Block device setup helpers (not tests)
+    # ------------------------------------------------------------------
+
+    def _create_software_raid(self, disk_list, level):
+        """
+        Create a software RAID array using all disks in disk_list for the
+        given level, via avocado.utils.softwareraid.SoftwareRaid.
+        Stores the instance in self.sraid and returns it.
+        """
+        self.log.info('Creating software RAID%s on: %s', level, disk_list)
+        sraid = softwareraid.SoftwareRaid(
+            '/dev/md/htx_sraid', level, disk_list, '1.2')
+        if not sraid.create():
+            self.fail('Failed to create software RAID%s' % level)
+        self.sraid = sraid
+        return sraid
+
+    def _cleanup_software_raid(self, sraid, disk_list):
+        """
+        Stop the RAID array, clear superblocks on the md device, then wipefs
+        each member disk — matching the _do_stop_raid() pattern in
+        io/disk/softwareraid.py.
+        clear_superblock() takes no arguments; it operates on the md device.
+        Per-disk wipefs is done separately in a loop, same as the reference.
+        """
+        self.log.info('Stopping software RAID: %s', sraid.name)
+        if not sraid.stop():
+            self.log.warning('Failed to stop RAID %s', sraid.name)
+        sraid.clear_superblock()
+        for dev in disk_list:
+            process.run('wipefs -af %s' % dev,
+                        shell=True, ignore_status=True)
+
+    def _create_lvm(self, disk_list):
+        """
+        Create PV -> VG (htx_vg) -> LV (htx_lv) on disk_list, following the
+        same steps as create_lvm() in io/disk/softwareraid.py.
+        Explicit pvcreate is run first, then lv_utils.vg_create/lv_create.
+        LV size is 45% of total space. For a single device (e.g. a RAID md
+        device) get_device_total_space is used; for multiple disks
+        get_devices_total_space is used, matching lvsetup.py.
+        Stores the backing device string in self.lv_backing_device.
+        Returns '/dev/htx_vg/htx_lv'.
+        """
+        device = ' '.join(disk_list)
+        self.log.info('Creating PV on %s', device)
+        ret = process.run('pvcreate -f %s' % device,
+                          shell=True, ignore_status=True)
+        if ret.exit_status != 0:
+            self.fail('pvcreate failed on %s: %s'
+                      % (device, ret.stderr_text))
+        if len(disk_list) == 1:
+            total_mb = lv_utils.get_device_total_space(
+                disk_list[0]) / (1024 * 1024)
+        else:
+            total_mb = lv_utils.get_devices_total_space(
+                disk_list) / (1024 * 1024)
+        lv_size = int(total_mb * 45 / 100) or 512
+        if lv_size > int(total_mb):
+            self.cancel(
+                'Device %s is too small (%dM) to create a %dM LV'
+                % (device, int(total_mb), lv_size))
+        self.log.info("Creating VG 'htx_vg' on %s", device)
+        lv_utils.vg_create('htx_vg', device, force=True)
+        if not lv_utils.vg_check('htx_vg'):
+            self.fail('VG htx_vg was not created')
+        self.log.info("Creating LV 'htx_lv' size=%dM", lv_size)
+        lv_utils.lv_create('htx_vg', 'htx_lv', lv_size)
+        if not lv_utils.lv_check('htx_vg', 'htx_lv'):
+            self.fail('LV htx_lv was not created')
+        self.lv_backing_device = device
+        return '/dev/htx_vg/htx_lv'
+
+    def _cleanup_lvm(self, backing_device):
+        """
+        Remove LV htx_lv -> VG htx_vg -> PV and wipe LVM metadata.
+        Mirrors _do_delete_lvm() in io/disk/softwareraid.py.
+        """
+        self.log.info('Removing LV/VG/PV on %s', backing_device)
+        if lv_utils.lv_check('htx_vg', 'htx_lv'):
+            lv_utils.lv_remove('htx_vg', 'htx_lv')
+        if lv_utils.vg_check('htx_vg'):
+            lv_utils.vg_remove('htx_vg')
+        process.run('pvremove -ff %s' % backing_device,
+                    shell=True, ignore_status=True)
+        process.run('wipefs -af %s' % backing_device,
+                    shell=True, ignore_status=True)
+        self.lv_backing_device = None
+
+    def _setup_software_raid(self, disk_list, level):
+        """
+        Create software RAID via _create_software_raid() and set
+        self.block_device to the RAID device basename.
+        """
+        self._create_software_raid(disk_list, level)
+        self.block_device = os.path.basename("/dev/md/htx_sraid")
+
+    def _setup_lvm(self, disk_list):
+        """
+        Create LVM via _create_lvm() on all disks in disk_list and
+        set self.block_device to the LV basename.
+        LVM-only setup — no RAID level mapping needed.
+        """
+        lv_path = self._create_lvm(disk_list)
+        self.block_device = os.path.basename(lv_path)
+
+    def _setup_sraid_lvm(self, disk_list, level):
+        """
+        Create software RAID via _create_software_raid(), then stack LVM
+        on top via _create_lvm(), and set self.block_device to the LV basename.
+        """
+        self._create_software_raid(disk_list, level)
+        lv_path = self._create_lvm(['/dev/md/htx_sraid'])
+        self.block_device = os.path.basename(lv_path)
+
+    # ------------------------------------------------------------------
+    # Block device tests — setup the stack then run HTX on it
+    # ------------------------------------------------------------------
+
+    def test_htx_software_raid(self):
+        """
+        HTX stress test on software RAID.
+        Cleans up RAID after each level iteration before creating the next.
+        """
+        if not self.htx_disks:
+            self.cancel("htx_disks must be set to run test_htx_software_raid")
+        self.setup_htx()
+        disk_list = [disk.get_absolute_disk_path(d)
+                     for d in self.htx_disks.split()]
+        for level in self._get_raid_levels_for_disk_count(disk_list):
+            self.log.info('=== HTX on software RAID%s ===', level)
+            self._ensure_daemon_running()
+            self._setup_software_raid(disk_list, level)
+            process.run('htxcmdline -createmdt', ignore_status=True)
+            self.test_start()
+            self.test_check()
+            self.test_stop()
+            # clean up before next level iteration
+            if self.sraid is not None:
+                self._cleanup_software_raid(self.sraid, disk_list)
+                self.sraid = None
+
+    def test_htx_lvm(self):
+        """
+        HTX stress test on LVM.
+        Creates LVM on all supplied disks, then runs HTX on the LV.
+        """
+        if not self.htx_disks:
+            self.cancel("htx_disks must be set to run test_htx_lvm")
+        self.setup_htx()
+        disk_list = [disk.get_absolute_disk_path(d)
+                     for d in self.htx_disks.split()]
+        self.log.info("=== HTX on LVM ===")
+        self._setup_lvm(disk_list)
+        self.test_start()
+        self.test_check()
+        self.test_stop()
+
+    def test_htx_sraid_lvm(self):
+        """
+        HTX stress test on software RAID with LVM stacked on top.
+        Cleans up LVM then RAID after each level iteration before the next.
+        """
+        if not self.htx_disks:
+            self.cancel(
+                "htx_disks must be set to run test_htx_sraid_lvm")
+        self.setup_htx()
+        disk_list = [disk.get_absolute_disk_path(d)
+                     for d in self.htx_disks.split()]
+        for level in self._get_raid_levels_for_disk_count(disk_list):
+            self.log.info('=== HTX on software RAID%s + LVM ===', level)
+            self._ensure_daemon_running()
+            self._setup_sraid_lvm(disk_list, level)
+            process.run('htxcmdline -createmdt', ignore_status=True)
+            self.test_start()
+            self.test_check()
+            self.test_stop()
+            # clean up LVM then RAID before next level iteration
+            if self.lv_backing_device:
+                self._cleanup_lvm(self.lv_backing_device)
+            if self.sraid is not None:
+                self._cleanup_software_raid(self.sraid, disk_list)
+                self.sraid = None
+
+    def tearDown(self):
+        """
+        Stop HTX and clean up LVM and RAID if created.
+        """
+        try:
+            self.stop_htx()
+        except Exception as ex:
+            self.log.warning('stop_htx() failed in tearDown: %s', ex)
+        if lv_utils.lv_check('htx_vg', 'htx_lv'):
+            try:
+                lv_utils.lv_remove('htx_vg', 'htx_lv')
+            except Exception as ex:
+                self.log.warning('Failed to remove LV htx_lv: %s', ex)
+        if lv_utils.vg_check('htx_vg'):
+            try:
+                lv_utils.vg_remove('htx_vg')
+            except Exception as ex:
+                self.log.warning('Failed to remove VG htx_vg: %s', ex)
+        if self.lv_backing_device:
+            try:
+                process.run('pvremove -f %s' % self.lv_backing_device,
+                            shell=True, ignore_status=True)
+            except Exception as ex:
+                self.log.warning('pvremove failed on %s: %s',
+                                 self.lv_backing_device, ex)
+        if self.sraid is not None and self.sraid.exists():
+            try:
+                self._cleanup_software_raid(self.sraid, self.sraid.disks)
+            except Exception as ex:
+                self.log.warning('RAID cleanup failed: %s', ex)
